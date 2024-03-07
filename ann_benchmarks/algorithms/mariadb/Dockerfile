@@ -24,8 +24,12 @@ RUN useradd -m mysql
 USER mysql
 WORKDIR /home/mysql
 RUN /usr/local/mysql/scripts/mariadb-install-db -u mysql
-# Initialization done, skip running init when benchmarking running in docker
+# Initialization done, skip running init when ann-benchmark is running in docker container
 ENV DO_INIT_MARIADB 0
+
+# Other environment variables for module.py
+ENV MARIADB_ROOT_DIR /usr/local/mysql
+ENV MARIADB_DB_WORKSPACE /home/mysql
 
 WORKDIR /home/app
 

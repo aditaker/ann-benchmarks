@@ -10,28 +10,14 @@ import mariadb
 
 from ..base.module import BaseANN
 
+@staticmethod
+def vector_to_hex(v):
+    binary_data = bytearray(v.size * 4)
+    for index, f in enumerate(v):
+        struct.pack_into('f', binary_data, index * 4, f)
+    return binary_data
 
 class MariaDB(BaseANN):
-
-    # Database setting can be overriden in ENV variable when running locally
-    MARIADB_INSTALL_DIR = os.environ.get('MARIADB_INSTALL_DIR', '/usr/local/mysql')
-    MARIADB_DB_WORKSPACE = os.environ.get('MARIADB_DB_WORKSPACE', '/home/mysql')
-    DO_INIT_MARIADB = os.environ.get('DO_INIT_MARIADB', '1')
-
-    # Path configuration
-    MARIADB_BIN_DIR = MARIADB_INSTALL_DIR + '/bin'
-    MARIADB_SCRIPTS_DIR = MARIADB_INSTALL_DIR + '/scripts'
-    DATA_DIR = MARIADB_DB_WORKSPACE + '/data'
-    LOG_FILE = MARIADB_DB_WORKSPACE + '/mariadb.err'
-
-    # Generate a socket file name under /tmp to make sure the file path is always under 107 character, to avoid "The socket file path is too long" error
-    SOCKET_FILE = tempfile.mktemp(prefix='mysql_', suffix='.sock', dir='/tmp')
-
-    print("\nSetup paths:")
-    print(f"MARIADB_BIN_DIR: {MARIADB_BIN_DIR}")
-    print(f"DATA_DIR: {DATA_DIR}")
-    print(f"LOG_FILE: {LOG_FILE}")
-    print(f"SOCKET_FILE: {SOCKET_FILE}\n")
 
     def __init__(self, metric, method_param):
         self._metric = metric
@@ -47,68 +33,84 @@ class MariaDB(BaseANN):
         else:
             raise RuntimeError(f"unknown metric {metric}")
         
-        MariaDB.verify_path()
-        # Initialize and bring the database server up
-        MariaDB.initialize_db()
-        MariaDB.start_db()
+        self.prepare_start_option()
+        self.initialize_db()
+        self.start_db()
 
         # Connect to MariaDB using Unix socket
-        conn = mariadb.connect(unix_socket=MariaDB.SOCKET_FILE)
+        conn = mariadb.connect(unix_socket=self._socket_file)
         self._cur = conn.cursor()
 
+    def prepare_start_option(self):
 
-    @staticmethod
-    def vector_to_hex(v):
-        binary_data = bytearray(v.size * 4)
-        for index, f in enumerate(v):
-            struct.pack_into('f', binary_data, index * 4, f)
-        return binary_data
+        # MariaDB build dir or installed dir
+        mariadb_root_dir = os.environ.get('MARIADB_ROOT_DIR')
+        if mariadb_root_dir is None:
+            print("MariaDB path MARIADB_ROOT_DIR is not provided. It can be your local build dir or installation dir. "
+                  "For local build dir, you also need to specify the MARIADB_SOURCE_DIR for database initialization.")
+            raise RuntimeError(f"Could not initialize database.")
 
-    @staticmethod
-    def verify_path():
-        # Verify mariadb-install-db exists
-        if not os.path.isfile(os.path.join(MariaDB.MARIADB_SCRIPTS_DIR, "mariadb-install-db")):
-            print(f"[ERROR] mariadb-install-db does not exist under {MariaDB.MARIADB_SCRIPTS_DIR}. Please make sure the MariaDB installation path is correct.")
-            raise RuntimeError(f"Could not verify installed MariaDB.")
+        # mariadb-install-db needs `--srcdir` option for local builds
+        mariadb_source_dir = os.environ.get('MARIADB_SOURCE_DIR')
 
-        # Verify mariadbd exists
-        if not os.path.isfile(os.path.join(MariaDB.MARIADB_INSTALL_DIR, "bin", "mariadbd")):
-            print(f"[ERROR] mariadbd does not exist under {MariaDB.MARIADB_INSTALL_DIR}/bin. Please make sure the MariaDB installation path is correct.")
-            raise RuntimeError(f"Could not start installed MariaDB.")
+        # Initialize database when running locally
+        self._do_init_mariadb = os.environ.get('DO_INIT_MARIADB', '1')
+
+        # DB workfolder: data + error log
+        mariadb_db_workspace = os.environ.get('MARIADB_DB_WORKSPACE')
+        if mariadb_db_workspace is None:
+            raise RuntimeError("Please specify path MARIADB_DB_WORKSPACE to define the database directory.")
+        data_dir = mariadb_db_workspace + '/data'
+        log_file = mariadb_db_workspace + '/mariadb.err'
+        # Create data directory if not exist
+        os.makedirs(f"{data_dir}", exist_ok=True)
+
+        # Generate a socket file name under /tmp to make sure the file path is always under 107 character, to avoid "The socket file path is too long" error
+        self._socket_file = tempfile.mktemp(prefix='mysql_', suffix='.sock', dir='/tmp')
+
+        print("\nSetup paths:")
+        print(f"MARIADB_ROOT_DIR: {mariadb_root_dir}")
+        print(f"DATA_DIR: {data_dir}")
+        print(f"LOG_FILE: {log_file}")
+        print(f"SOCKET_FILE: {self._socket_file}\n")
+
+        # Command for MariaDB initialization
+        self._mariadb_init_cmd = (f"{mariadb_root_dir}/*/mariadb-install-db" + 
+                                     f" --no-defaults --verbose --skip-name-resolve --skip-test-db --datadir={data_dir}" + 
+                                     (f" --srcdir={mariadb_source_dir}" if mariadb_source_dir is not None else ""))
+
+        # Command for starting MariaDB server
+        self._mariadb_start_cmd = (f"{mariadb_root_dir}/*/mariadbd" + 
+                                   f" --no-defaults --datadir={data_dir} --log_error={log_file} --socket={self._socket_file} --skip_networking --skip_grant_tables {MariaDB.get_user_option()} &")
 
 
-    @staticmethod
-    def initialize_db():
+    def initialize_db(self):
         try:
             # In ann-benchmarks build, the server was initialized in Docker image, but when running locally we want to start it with a new initialization
-            if MariaDB.DO_INIT_MARIADB == '1':
+            if self._do_init_mariadb == '1':
                 print("\nInitialize MariaDB database...")
-                cmd = f"{MariaDB.MARIADB_SCRIPTS_DIR}/mariadb-install-db --no-defaults --verbose --skip-name-resolve --skip-test-db --datadir={MariaDB.DATA_DIR}"
-                print(cmd)
-                subprocess.run(cmd, shell=True, check=True, stdout=sys.stdout, stderr=sys.stderr)
+                print(self._mariadb_init_cmd)
+                subprocess.run(self._mariadb_init_cmd, shell=True, check=True, stdout=sys.stdout, stderr=sys.stderr)
         except Exception as e:
-            print("[ERROR] Failed to initialize MariaDB database:", e)
+            print("ERROR: Failed to initialize MariaDB database:", e)
             raise
 
     @staticmethod
-    def get_unix_user():
+    def get_user_option():
+        # to support running with root user
         try:
-            return getpass.getuser()
+            return "--user=root" if getpass.getuser() == "root" else ""
         except Exception as e:
             print("Could not get current user, could be docker user mapping. Ignore.")
+            return ""
 
-    @staticmethod
-    def start_db():
+    def start_db(self):
         try:
             print("\nStarting MariaDB server...")
-            # The module does not prevent from running multiple servers on the same host or against same data directory, users need to maintain by themselves
-            os.makedirs(MariaDB.DATA_DIR, exist_ok=True)
-            user_option = "--user=root" if MariaDB.get_unix_user() == "root" else ""
-            cmd = f"{MariaDB.MARIADB_BIN_DIR}/mariadbd --no-defaults --datadir={MariaDB.DATA_DIR} --log_error={MariaDB.LOG_FILE} --socket={MariaDB.SOCKET_FILE} --skip_networking --skip_grant_tables {user_option} &"
-            print(cmd)
-            subprocess.run(cmd, shell=True, check=True, stdout=sys.stdout, stderr=sys.stderr)
+            print(self._mariadb_start_cmd)
+            subprocess.run(self._mariadb_start_cmd, shell=True, check=True, stdout=sys.stdout, stderr=sys.stderr)
         except Exception as e:
-            print("[ERROR] Failed to start MariaDB database:", e)
+            print("ERROR: Failed to start MariaDB database:", e)
             raise
 
         # Server is expected to start in less than 30s
@@ -117,7 +119,7 @@ class MariaDB(BaseANN):
             if time.time() - start_time > 30:
                 raise TimeoutError("Timeout waiting for MariaDB server to start")
             try:
-                if os.path.exists(MariaDB.SOCKET_FILE):
+                if os.path.exists(self._socket_file):
                     print("\nMariaDB server started!")
                     break
             except FileNotFoundError:
@@ -140,7 +142,7 @@ class MariaDB(BaseANN):
         print("\nInserting data...")
         start_time = time.time()
         for i, embedding in enumerate(X):
-            self._cur.execute("INSERT INTO t1 (id, v) VALUES (%d, %s)", (i, bytes(MariaDB.vector_to_hex(embedding))))
+            self._cur.execute("INSERT INTO t1 (id, v) VALUES (%d, %s)", (i, bytes(vector_to_hex(embedding))))
         self._cur.execute("commit")
         print(f"\nInsert time for {X.size} records: {time.time() - start_time}")
 
@@ -164,7 +166,7 @@ class MariaDB(BaseANN):
         #self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
 
     def query(self, v, n):
-        self._cur.execute("SELECT id FROM t1 ORDER by vec_distance(v, %s) LIMIT %d", (bytes(MariaDB.vector_to_hex(v)), n))
+        self._cur.execute("SELECT id FROM t1 ORDER by vec_distance(v, %s) LIMIT %d", (bytes(vector_to_hex(v)), n))
         return [id for id, in self._cur.fetchall()]
 
     # TODO for MariaDB, get the memory usage when index is supported:
