@@ -25,7 +25,7 @@ class MariaDB(BaseANN):
         self._test_time = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
         self._metric = metric
         self._m = method_param['M']
-        self._ef_construction = method_param['efConstruction']
+        self._engine = method_param['engine']
         self._cur = None
         self._perf_proc = None
         self._perf_records = []
@@ -108,7 +108,7 @@ class MariaDB(BaseANN):
             f"--socket={self._socket_file}",
             "--skip_networking",
             "--skip_grant_tables",
-            "--skip_grant_tables"
+            f"--mhnsw_max_edges_per_node={self._m}"
         ]
         user_option = MariaDB.get_user_option()
         if user_option is not None:
@@ -248,10 +248,7 @@ class MariaDB(BaseANN):
         self._cur.execute("DROP DATABASE IF EXISTS ann")
         self._cur.execute("CREATE DATABASE ann")
         self._cur.execute("USE ann")
-        # Innodb create table with index is not supported with the latest commit of the develop branch.
-        # Once all supported we could use:
-        #self._cur.execute("CREATE TABLE t1 (id INT PRIMARY KEY, v BLOB NOT NULL, vector INDEX (v)) ENGINE=InnoDB;")
-        self._cur.execute("CREATE TABLE t1 (id INT PRIMARY KEY, v BLOB NOT NULL, vector INDEX (v)) ENGINE=MyISAM;")
+        self._cur.execute(f"CREATE TABLE t1 (id INT PRIMARY KEY, v BLOB NOT NULL, vector INDEX (v)) ENGINE={self._engine};")
 
         # Insert data
         print("\nInserting data...")
@@ -284,8 +281,7 @@ class MariaDB(BaseANN):
     def set_query_arguments(self, ef_search):
         # Set ef_search
         self._ef_search = ef_search
-        # Not supported by MariaDB at the moment
-        #self._cur.execute("SET hnsw.ef_search = %d" % ef_search)
+        self._cur.execute("SET mhnsw_limit_multiplier = %d" % ef_search)
 
     def query(self, v, n):
         self._cur.execute("SELECT id FROM t1 ORDER by vec_distance(v, %s) LIMIT %d", (bytes(vector_to_hex(v)), n))
@@ -299,7 +295,7 @@ class MariaDB(BaseANN):
     #      return self._cur.fetchone()[0] / 1024
 
     def __str__(self):
-        return f"MariaDB(m={self._m}, ef_construction={self._ef_construction}, ef_search={self._ef_search})"
+        return f"MariaDB(m={self._m}, ef_search={self._ef_search}, engine={self._engine})"
 
     def done(self):
         # Shutdown MariaDB server when benchmarking done
